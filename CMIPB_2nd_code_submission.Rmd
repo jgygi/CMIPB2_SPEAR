@@ -1,0 +1,549 @@
+---
+title: "SPEAR + Lasso: all tasks"
+author: "Jeremy Gygi (Steven Kleinstein Lab + Leying Guan Lab)"
+output: html_notebook
+---
+
+Packages
+
+```{r}
+# For SPEAR: (https://bitbucket.org/kleinstein/SPEAR)
+library(SPEAR)
+library(MultiAssayExperiment)
+# For lasso:
+library(glmnet)
+# For plotting:
+library(ggplot2)
+library(UpSetR)
+# For imputation:
+library(MOFA2)
+```
+
+Data
+
+```{r}
+train.data <- readRDS("../master_processed_training_data.RDS")
+data <- readRDS("../master_harmonized_training_data.RDS")
+
+test.data <- readRDS("../master_processed_prediction_data.RDS")
+data.te <- readRDS("../master_processed_prediction_data.RDS")
+```
+
+Preprocessing: Convert tibbles into computable matrices (remove specimen_id column and make rownames)
+
+```{r}
+# Perform initial loading:
+# SPEAR needs matrices
+ab_titers <- as.matrix(t(train.data$abtiter_wide$normalized_data))
+olink <- as.matrix(t(train.data$plasma_cytokine_concentrations$normalized_data))
+cytof <- as.matrix(t(train.data$pbmc_cell_frequency$normalized_data))
+gex <- as.matrix(t(train.data$pbmc_gene_expression$batchCorrected_data))
+
+# Test data:
+ab_titers.te <- as.matrix(t(test.data$abtiter$processed_similar_to_training))
+olink.te <- as.matrix(t(test.data$plasma_cytokine_concentrations$processed_similar_to_training))
+cytof.te <- as.matrix(t(test.data$pbmc_cell_frequency$processed_similar_to_training))
+gex.te <- as.matrix(t(test.data$pbmc_gene_expression$processed_similar_to_training))
+```
+
+Preprocessing: Check distributions
+
+ab_titers:
+
+```{r}
+# Ab Titers:
+ab_titers_preprocessed <- apply(ab_titers, 2, log2)
+ab_titers_preprocessed_sc <- scale(ab_titers_preprocessed)
+ab_titers_preprocessed.te <- apply(ab_titers.te, 2, log2)
+ab_titers_preprocessed_sc.te <- scale(ab_titers_preprocessed.te)
+
+# OLINK:
+# NOTE: Removing IL4 (less than 0...)
+olink_preprocessed <- olink[,colnames(olink)!="P05112"]
+olink_preprocessed <- apply(olink_preprocessed, 2, log2)
+olink_preprocessed_sc <- scale(olink_preprocessed)
+# NOTE: Removing IL4 (less than 0...)
+olink_preprocessed.te <- olink.te[,colnames(olink.te)!="P05112"]
+olink_preprocessed.te <- apply(olink_preprocessed.te, 2, log2)
+olink_preprocessed_sc.te <- scale(olink_preprocessed.te)
+
+# CyTOF:
+cytof_preprocessed <- apply(cytof, 2, sqrt)
+cytof_preprocessed_sc <- scale(cytof_preprocessed)
+cytof_preprocessed.te <- apply(cytof.te, 2, sqrt)
+cytof_preprocessed_sc.te <- scale(cytof_preprocessed.te)
+
+# Gene Expression:
+half.min = min(gex[gex != 0])/2
+gex_preprocessed <- apply(gex + half.min, 2, log2)
+gex_preprocessed_sc <- scale(gex_preprocessed)
+half.min.te = min(gex.te[gex.te != 0])/2
+gex_preprocessed.te <- apply(gex.te + half.min.te, 2, log2)
+gex_preprocessed_sc.te <- scale(gex_preprocessed.te)
+```
+
+Check dimensions and number of samples:
+
+```{r}
+print("Train")
+dim(ab_titers_preprocessed_sc)
+dim(olink_preprocessed_sc)
+dim(cytof_preprocessed_sc)
+dim(gex_preprocessed_sc)
+print("Test")
+dim(ab_titers_preprocessed_sc.te)
+dim(olink_preprocessed_sc.te)
+dim(cytof_preprocessed_sc.te)
+dim(gex_preprocessed_sc.te)
+```
+
+analyte overlap:
+
+```{r}
+# ab_titers:
+tr.analytes <- colnames(ab_titers_preprocessed_sc)
+te.analytes <- colnames(ab_titers_preprocessed_sc.te)
+which(!tr.analytes %in% te.analytes)
+tr.analytes <- colnames(olink_preprocessed_sc)
+te.analytes <- colnames(olink_preprocessed_sc.te)
+which(!tr.analytes %in% te.analytes)
+tr.analytes <- colnames(cytof_preprocessed_sc)
+te.analytes <- colnames(cytof_preprocessed_sc.te)
+which(!tr.analytes %in% te.analytes)
+tr.analytes <- colnames(gex_preprocessed_sc)
+te.analytes <- colnames(gex_preprocessed_sc.te)
+which(!tr.analytes %in% te.analytes)
+```
+
+Note that CyTOF from test data has two extra features:
+
+```{r}
+# Confirm overlap:
+tr.analytes <- colnames(cytof_preprocessed_sc)
+te.analytes <- colnames(cytof_preprocessed_sc.te)
+colnames(cytof_preprocessed_sc.te)[which(!te.analytes %in% tr.analytes)]
+# Remove them from test:
+cytof_preprocessed_sc.te <- cytof_preprocessed_sc.te[,-c(which(!te.analytes %in% tr.analytes))]
+# Check again:
+tr.analytes <- colnames(cytof_preprocessed_sc)
+te.analytes <- colnames(cytof_preprocessed_sc.te)
+which(!te.analytes %in% tr.analytes)
+```
+
+specimen_id overlap:
+
+```{r}
+specimen_ids_list <- list(gex = rownames(gex_preprocessed), ab_titers = rownames(ab_titers_preprocessed), olink = rownames(olink_preprocessed), cytof = rownames(cytof_preprocessed))
+specimen_ids_list.te <- list(gex = rownames(gex_preprocessed.te), ab_titers = rownames(ab_titers_preprocessed.te), olink = rownames(olink_preprocessed.te), cytof = rownames(cytof_preprocessed.te))
+
+UpSetR::upset(data = UpSetR::fromList(specimen_ids_list))
+UpSetR::upset(data = UpSetR::fromList(specimen_ids_list.te))
+```
+
+Get overlapping subjects:
+
+```{r}
+comb_ids <- dplyr::intersect(
+              dplyr::intersect(
+                dplyr::intersect(specimen_ids_list$gex, specimen_ids_list$ab_titers), 
+                  specimen_ids_list$olink), 
+              specimen_ids_list$cytof)
+comb_ids.te <- dplyr::intersect(
+              dplyr::intersect(
+                dplyr::intersect(specimen_ids_list.te$gex, specimen_ids_list.te$ab_titers), 
+                  specimen_ids_list.te$olink), 
+              specimen_ids_list.te$cytof)
+
+
+
+# Which are baseline?
+comb_visits <- sapply(comb_ids, function(s_id){
+  return(data$subject_specimen$visit[which(data$subject_specimen$specimen_id == s_id)])
+})
+visit1_comb_ids <- comb_ids[which(comb_visits == 1)]
+comb_visits.te <- sapply(comb_ids.te, function(s_id){
+  return(data.te$subject_specimen$planned_day_relative_to_boost[which(data.te$subject_specimen$specimen_id == s_id)])
+})
+visit1_comb_ids.te <- comb_ids.te[which(comb_visits.te == 0)]
+
+# Participants:
+visit1_comb_participants <- sapply(visit1_comb_ids, function(s_id){
+  return(data$subject_specimen$subject_id[which(data$subject_specimen$specimen_id == s_id)])
+})
+visit1_comb_participants.te <- sapply(visit1_comb_ids.te, function(s_id){
+  return(data.te$subject_specimen$subject_id[which(data.te$subject_specimen$specimen_id == s_id)])
+})
+
+# Some test participants are missing a baseline...
+all.te <- unique(data.te$subject_specimen$subject_id)
+full.te <- unname(visit1_comb_participants.te)
+missing.te <- all.te[!all.te %in% full.te]
+print(length(missing.te))
+print(missing.te)
+
+# Do these 2 individuals have full timepoints prior?
+dplyr::filter(data.te$subject_specimen, subject_id %in% missing.te)
+
+# Unfortunately some don't... need to impute...
+```
+
+# Quick MOFA imputation:
+
+```{r}
+datasets_combined = list(
+  ab_titers = ab_titers_preprocessed_sc.te,
+  olink = olink_preprocessed_sc.te,
+  cytof = cytof_preprocessed_sc.te,
+  gex = gex_preprocessed_sc.te
+)
+
+generate_full_matrices = function(datasets_combined){
+  event_ids <- sort(unique(unlist(sapply(datasets_combined, function(i){return(rownames(i))}))))
+  new_datasets_combined <- list()
+  for(i in 1:length(datasets_combined)){
+    print(i)
+    d <- datasets_combined[[i]]
+    m <- matrix(NA, nrow = length(event_ids), ncol = ncol(d))
+    rownames(m) <- event_ids
+    colnames(m) <- colnames(d)
+    m <- as.data.frame(m)
+    m[rownames(d),] <- d
+    new_datasets_combined[[i]] <- m
+  }
+  names(new_datasets_combined) <- names(datasets_combined)
+  return(new_datasets_combined)
+}
+
+datasets_full_combined <- generate_full_matrices(datasets_combined)
+
+
+
+# Run MOFA+:
+x.mofa <- list()
+for(d in 1:length(datasets_full_combined)){
+  x.mofa[[d]] = t(datasets_full_combined[[d]])
+}
+names(x.mofa) = names(datasets_full_combined)
+MOFAobject <- create_mofa(x.mofa)
+# MOFA+ specific parameters:
+data_opts <- get_default_data_options(MOFAobject)
+model_opts <- get_default_model_options(MOFAobject)
+train_opts <- get_default_training_options(MOFAobject)
+model_opts$num_factors = 63
+train_opts$convergence_mode = "fast"
+train_opts$startELBO = 2
+train_opts$maxiter = 1000
+train_opts$stochastic = FALSE
+train_opts$seed = 42
+train_opts$drop_factor_threshold = -1
+MOFAobject <- prepare_mofa(
+  object = MOFAobject,
+  data_options = data_opts,
+  model_options = model_opts,
+  training_options = train_opts
+)
+MOFAobject.trained <- run_mofa(MOFAobject,use_basilisk = TRUE, save_data = F)
+
+imputedMOFA <- MOFA2::predict(MOFAobject.trained, factors = "all", add_intercept = T)
+# Replace any NA in data with imputedMOFA:
+tmp = datasets_full_combined
+names(tmp) <- names(datasets_full_combined)
+for(i in 1:length(tmp)){
+  non_observed <- is.na(tmp[[i]])
+  tmp[[i]][non_observed] = t(imputedMOFA[[i]][[1]])[non_observed]
+}
+datasets_full_combined <- tmp
+lapply(datasets_full_combined, dim)
+```
+
+Save/Load Imputed Data
+
+```{r}
+#saveRDS(datasets_full_combined, "prediction_imputed_data.rds")
+datasets_full_combined <- readRDS("prediction_imputed_data.rds")
+```
+
+Preparing Test Data:
+
+```{r}
+# Check all 63 samples are full:
+specimen_ids_list.te <- list(gex = rownames(datasets_full_combined$gex), ab_titers = rownames(datasets_full_combined$ab_titers), olink = rownames(datasets_full_combined$olink), cytof = rownames(datasets_full_combined$cytof))
+UpSetR::upset(data = UpSetR::fromList(specimen_ids_list.te))
+
+# Get baseline for predictions:
+comb_ids.te <- dplyr::intersect(
+              dplyr::intersect(
+                dplyr::intersect(specimen_ids_list.te$gex, specimen_ids_list.te$ab_titers), 
+                  specimen_ids_list.te$olink), 
+              specimen_ids_list.te$cytof)
+length(comb_ids.te) # 63
+
+
+# Which are baseline?
+comb_visits.te <- sapply(comb_ids.te, function(s_id){
+  return(data.te$subject_specimen$planned_day_relative_to_boost[which(data.te$subject_specimen$specimen_id == s_id)])
+})
+visit1_comb_ids.te <- comb_ids.te[which(comb_visits.te == 0)]
+length(visit1_comb_ids.te) # 21
+
+# Participants:
+visit1_comb_participants.te <- sapply(visit1_comb_ids.te, function(s_id){
+  return(data.te$subject_specimen$subject_id[which(data.te$subject_specimen$specimen_id == s_id)])
+})
+```
+
+Obtain response values for SPEAR training:
+
+```{r}
+# Train:
+# Getting responses for tasks:
+visit1_comb_participants <- sapply(visit1_comb_ids, function(s_id){
+  return(data$subject_specimen$subject_id[which(data$subject_specimen$specimen_id == s_id)])
+})
+
+# Task 1: day 14 IgG_PT:
+task1.Y <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day14 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 5)]
+  return(ab_titers_preprocessed[as.character(specimen_id_day14),"IgG_PT"])
+})
+# Task 1: day 14 IgG_PT FC (vs. day 0):
+task1.Y.FC <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day14 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 5)]
+  specimen_id_day0 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 1)]
+  return(ab_titers_preprocessed[as.character(specimen_id_day14),"IgG_PT"] - ab_titers_preprocessed[as.character(specimen_id_day0),"IgG_PT"])
+})
+
+# Task 2: day 1 Monocytes:
+task2.Y <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day1 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 2)]
+  return(cytof_preprocessed[as.character(specimen_id_day1),"Monocytes"])
+})
+# Task 2: day 1 Monocytes: FC (vs. day 0):
+task2.Y.FC <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day1 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 2)]
+  specimen_id_day0 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 1)]
+  return(sqrt(cytof[as.character(specimen_id_day1),"Monocytes"]/cytof[as.character(specimen_id_day0),"Monocytes"]))
+})
+
+# Task 3: day 3 CCL3:
+task3.Y <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day3 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 3)]
+  return(gex_preprocessed[as.character(specimen_id_day3),"ENSG00000277632.1"])
+})
+# Task 3: day 3 CCL3: FC (vs. day 0):
+task3.Y.FC <- sapply(visit1_comb_participants, function(s_id){
+  specimen_id_day3 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 3)]
+  specimen_id_day0 <- data$subject_specimen$specimen_id[which(data$subject_specimen$subject_id == s_id & data$subject_specimen$visit == 1)]
+  return(gex_preprocessed[as.character(specimen_id_day3),"ENSG00000277632.1"] - gex_preprocessed[as.character(specimen_id_day0),"ENSG00000277632.1"])
+})
+
+# Scale tasks:
+task1.Y <- scale(task1.Y)
+task1.Y.FC <- scale(task1.Y.FC)
+task2.Y <- scale(task2.Y)
+task2.Y.FC <- scale(task2.Y.FC)
+task3.Y <- scale(task3.Y)
+task3.Y.FC <- scale(task3.Y.FC)
+```
+
+Molding data into SPEAR-ready format:
+
+```{r}
+assay_ab_titers <- ab_titers_preprocessed_sc[visit1_comb_ids,]
+assay_olink <- olink_preprocessed_sc[visit1_comb_ids,]
+assay_cytof <- cytof_preprocessed_sc[visit1_comb_ids,]
+assay_gex <- gex_preprocessed_sc[visit1_comb_ids,]
+
+assay_ab_titers.te <- datasets_full_combined$ab_titers[visit1_comb_ids.te,]
+assay_olink.te <- datasets_full_combined$olink[visit1_comb_ids.te,]
+assay_cytof.te <- datasets_full_combined$cytof[visit1_comb_ids.te,]
+assay_gex.te <- datasets_full_combined$gex[visit1_comb_ids.te,]
+
+dim(assay_ab_titers)
+dim(assay_olink)
+dim(assay_cytof)
+dim(assay_gex)
+
+dim(assay_ab_titers.te)
+dim(assay_olink.te)
+dim(assay_cytof.te)
+dim(assay_gex.te)
+```
+
+Model Training:
+
+```{r}
+# Function to get clinical values:
+get.clinical.values <- function(taskname, clinical.values = NULL){
+  res <- list()
+  for(val in clinical.values){
+    if(val == "baseline"){
+      if(taskname == "task1.1" | taskname == "1_1"){
+        res[["baseline"]] <- assay_ab_titers[,"IgG_PT"]
+      } else if(taskname == "task1.2" | taskname == "1_2") {
+        res[["baseline"]] <- assay_ab_titers[,"IgG_PT"]
+      } else if(taskname == "task2.1" | taskname == "2_1") {
+        res[["baseline"]] <- assay_cytof[,"Monocytes"]
+      } else if(taskname == "task2.2" | taskname == "2_2") {
+        res[["baseline"]] <- assay_cytof[,"Monocytes"]
+      } else if(taskname == "task3.1" | taskname == "3_1") {
+        res[["baseline"]] <- assay_gex[,"ENSG00000277632.1"]
+      } else if(taskname == "task3.2" | taskname == "3_2") {
+        res[["baseline"]] <- assay_gex[,"ENSG00000277632.1"]
+      }
+    } else if(val == "age"){
+      tmp <- data$subject_specimen[rownames(assay_ab_titers),]
+      approx.age <- sapply(1:nrow(tmp), function(idx){
+        return(as.integer(difftime(as.Date("2022-01-01"), tmp$year_of_birth[idx], units = "days")/365))
+      })
+      res[["approx_age"]] <- approx.age
+    } else if(val == "sex"){
+      tmp <- data$subject_specimen[rownames(assay_ab_titers),]
+      res[["biological_sex"]] <- ifelse(tmp$biological_sex == "Male", 1, 0)
+    } else if(val == "vac"){
+      tmp <- data$subject_specimen[rownames(assay_ab_titers),]
+      res[["infancy_vac"]] <- ifelse(tmp$infancy_vac == "wP", 1, 0)
+    }
+  }
+  return(do.call("cbind", res))
+}
+
+# Response
+Y.list <- list(
+  task1.1 = task1.Y,
+  task1.2 = task1.Y.FC,
+  task2.1 = task2.Y,
+  task2.2 = task2.Y.FC,
+  task3.1 = task3.Y,
+  task3.2 = task3.Y.FC
+)
+
+# How many SPEAR factors:
+k = 10
+
+# Names for files to save models:
+modelnames <- c(paste0("spear_task_1_1_k", k, ".rds"),
+                paste0("spear_task_1_2_k", k, ".rds"),
+                paste0("spear_task_2_1_k", k, ".rds"),
+                paste0("spear_task_2_2_k", k, ".rds"),
+                paste0("spear_task_3_1_k", k, ".rds"),
+                paste0("spear_task_3_2_k", k, ".rds"))
+
+# Run SPEAR and Ensemble?
+do.spear <- TRUE
+do.ensemble <- TRUE
+
+for(i in 1:6){
+  # list of assays (rows = analytes, cols = samples!)
+  assays.tr <- list(olink = t(assay_olink),
+                 cytof = t(assay_cytof),
+                 gex = t(assay_gex),
+                 ab_titers = t(assay_ab_titers))
+  Y.tr <- Y.list[[i]]
+  spear.modelname <- modelnames[i]
+  # add response in colData:
+  df.tr <- data.frame(Response = as.vector(Y.tr),
+                   row.names = rownames(assay_ab_titers))
+
+  # MAE:
+  mae.tr <- MultiAssayExperiment::MultiAssayExperiment(experiments = assays.tr,
+                                                    colData = df.tr)
+  if(do.spear){
+      SPEARobj <- SPEAR::new.spear(data = mae.tr,
+                                         response = "Response",
+                                         num.factors = k,
+                                         num.folds = 2,
+                                         print.out = 5)
+    
+      # perform leave-one-out cv training:
+      SPEARobj$train.spear()
+      saveRDS(SPEARobj, file = spear.modelname)
+  }
+  
+  if(do.ensemble){
+    SPEARobj <- readRDS(spear.modelname)
+    SPEARobj$set.weights(method = "min")
+    fs <- SPEARobj$get.factor.scores()
+    Xcomb <- cbind(fs, get.clinical.values(taskname = names(Y.list)[i], clinical.values = c("baseline", "age", "sex", "vac")))
+    colnames(Xcomb) <- c(colnames(fs), "Baseline", "Approx_age", "Biological_sex", "Infancy_vac")
+    lasso_fit = glmnet::cv.glmnet(x = Xcomb, y = Y.tr, foldid = 1:46)
+    #saveRDS(lasso_fit, file = gsub("spear", "ensemble", spear.modelname))
+  }
+}
+```
+
+Generate Predictions:
+
+```{r}
+get.clinical.values.te <- function(taskname, clinical.values = NULL){
+  res <- list()
+  for(val in clinical.values){
+    if(val == "baseline"){
+      if(taskname == "task1.1" | taskname == "1_1"){
+        res[["baseline"]] <- assay_ab_titers.te[,"IgG_PT"]
+      } else if(taskname == "task1.2" | taskname == "1_2") {
+        res[["baseline"]] <- assay_ab_titers.te[,"IgG_PT"]
+      } else if(taskname == "task2.1" | taskname == "2_1") {
+        res[["baseline"]] <- assay_cytof.te[,"Monocytes"]
+      } else if(taskname == "task2.2" | taskname == "2_2") {
+        res[["baseline"]] <- assay_cytof.te[,"Monocytes"]
+      } else if(taskname == "task3.1" | taskname == "3_1") {
+        res[["baseline"]] <- assay_gex.te[,"ENSG00000277632.1"]
+      } else if(taskname == "task3.2" | taskname == "3_2") {
+        res[["baseline"]] <- assay_gex.te[,"ENSG00000277632.1"]
+      }
+    } else if(val == "age"){
+      tmp <- data.te$subject_specimen[which(data.te$subject_specimen$specimen_id %in% as.integer(rownames(assay_ab_titers.te))),]
+      approx.age <- sapply(1:nrow(tmp), function(idx){
+        return(as.integer(difftime(as.Date("2022-01-01"), tmp$year_of_birth[idx], units = "days")/365))
+      })
+      res[["approx_age"]] <- approx.age
+    } else if(val == "sex"){
+      tmp <- data.te$subject_specimen[which(data.te$subject_specimen$specimen_id %in% as.integer(rownames(assay_ab_titers.te))),]
+      res[["biological_sex"]] <- ifelse(tmp$biological_sex == "Male", 1, 0)
+    } else if(val == "vac"){
+      tmp <- data.te$subject_specimen[which(data.te$subject_specimen$specimen_id %in% as.integer(rownames(assay_ab_titers.te))),]
+      res[["infancy_vac"]] <- ifelse(tmp$infancy_vac == "wP", 1, 0)
+    }
+  }
+  return(do.call("cbind", res))
+}
+
+assays.te <- list(olink = t(assay_olink.te),
+                 cytof = t(assay_cytof.te),
+                 gex = t(assay_gex.te),
+                 ab_titers = t(assay_ab_titers.te))
+df.te <- data.frame(Response = rep(NA, length = nrow(assay_ab_titers.te)),
+                    row.names = rownames(assay_ab_titers.te))
+participant_ids_te <- unname(visit1_comb_participants.te[rownames(assay_ab_titers.te)])
+
+# MAE:
+mae.te <- MultiAssayExperiment::MultiAssayExperiment(experiments = assays.te,
+                                                    colData = df.te)
+
+preds <- list()
+for(i in 1:6){
+  SPEARmodel <- readRDS(modelnames[i])
+  SPEARmodel$set.weights(method = "min")
+  SPEARmodel$add.data(data = mae.te, name = "test")
+  fs.te <- SPEARmodel$get.factor.scores(data = "test")
+  Xcomb.te <- cbind(fs.te, get.clinical.values.te(taskname = names(Y.list)[i], clinical.values = c("baseline", "age", "sex", "vac")))
+  colnames(Xcomb.te) <- c(colnames(fs.te), "Baseline", "Approx_age", "Biological_sex", "Infancy_vac")
+  lasso_fit = readRDS(gsub("spear", "ensemble", modelnames[i]))
+  tmp = stats::predict(lasso_fit, Xcomb.te, s = "lambda.min")
+  rownames(tmp) <- participant_ids_te
+  colnames(tmp) <- names(Y.list)[i]
+  preds[[i]] <- tmp
+}
+
+preds.df <- do.call("cbind", preds)
+#saveRDS(preds.df, "010924_SPEAR_ensemble_predictions_final.rds")
+```
+
+Finally, write table for predictions:
+
+```{r}
+preds.df <- readRDS("010924_SPEAR_ensemble_predictions_final.rds")
+preds.df.ranked <- apply(preds.df, 2, function(col){return(rank(-col))})
+#write.csv(preds.df.ranked, "SPEAR_ensemble_predictions.csv")
+```
